@@ -35,6 +35,16 @@
   `nonce_replay`）时**整批失败、整体回滚——包括本来可以成功的链在内，任何链都
   不新增事件**。全部成功才整体提交，响应 `results` **按请求顺序**返回每条链的新
   序号 `seq` 与新链尾 `tail_hash`。
+- **交付清单核对** `POST /inventories/reconcile`：收货方按交付清单批量核对
+  **2～100 条**链（请求体 `items` 各携带 `chain_id`、`file_hash`、
+  `current_holder`、`tail_hash`；**同批 `chain_id` 不得重复**，重复或条数不在
+  2～100 范围内返回 422）。服务端在**同一个 SQLite 读事务**内读取各链链头与
+  当时最大的事件数据库 id（`MAX(events.id)`，全库无事件时为 0），返回
+  `snapshot_event_id`（核对锚定的事件快照）、`matched_count` 与逐项状态：
+  链不存在为 `missing`，否则依 `file_mismatch`（文件摘要不符）→
+  `holder_mismatch`（当前持有人不符）→ `tail_mismatch`（链尾哈希不符）顺序
+  取**首个不符项**，四项完全一致为 `matched`。结果严格**保持输入顺序**。
+  本接口**只读**：不追加事件、不推进链尾、不写任何表。
 - **待接收移交（邀约确认）**：除直接移交外，持有人也可先发起邀约、由接收方确认：
   1. **发起邀约** `POST /offers`：携带当前 `tail_hash`、指定的 `receiver`、
      有效期 `expires_in_seconds`（秒，上限 7 天）与一次性确认码
@@ -282,6 +292,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/chains` | 创建交接链（文件摘要 + 首位持有人） |
 | `POST` | `/handovers` | 执行一次移交（链尾哈希 + 接收方 + 一次性随机数） |
 | `POST` | `/handover-batches` | 批量移交：同一批 2～20 条链（同批 chain_id 不得重复）在一个立即事务内整批校验并追加事件、推进各链尾给同一接收方；任一链不存在/封存生效/链尾过期/随机数重放则整批回滚，任何链不新增事件；响应按请求顺序返回各链新 seq 与 tail_hash |
+| `POST` | `/inventories/reconcile` | 交付清单核对：同一读事务内读取 2～100 条链的链头与 MAX(events.id) 快照（无事件为 0），逐项按 missing → file_mismatch → holder_mismatch → tail_mismatch 判定，全一致为 matched；返回 snapshot_event_id、matched_count 与按输入顺序的逐项状态；只读，不写库 |
 | `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选撤销码，凭码可撤销/替换；可选 2～5 名见证人与阈值） |
 | `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
 | `POST` | `/offers/{offer_id}/cancel` | 凭一次性撤销码撤销邀约（仅 pending 且链尾未推进/未过期/无拒绝；错码 403，终态或无撤销码 409；不改链） |
@@ -349,6 +360,11 @@ chain_id/holder/role/created_from/created_to 不符；**不会回退为新查询
 命中即整批回滚（包括本来可以成功的链），错误 `detail` 中附带首个失败链的
 `chain_id`；同批 `chain_id` 重复、条数不在 2～20 或字段格式非法为请求级
 **422**。
+
+交付清单核对 `POST /inventories/reconcile` 同样**不引入新错误码**：核对结果
+（含 `missing` / `file_mismatch` / `holder_mismatch` / `tail_mismatch`）一律
+以 **200** 逐项返回，不作错误处理；仅请求级校验失败为 **422**——同批
+`chain_id` 重复、条数不在 2～100 或字段格式非法（如哈希非 64 位十六进制）。
 
 ## 使用示例
 
@@ -429,6 +445,48 @@ curl -i -X POST http://localhost:8000/handover-batches \
          {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"x1"},
          {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"x2"}]}'
 # 422（同批 chain_id 不得重复）；注意各链 nonce 相互独立，不同链允许相同 nonce
+```
+
+### 交付清单核对示例
+
+适用于「收货方拿到交付清单后，批量核对多条链是否与服务端一致」的场景：2～100 条
+链的链头读取与快照锚点（`MAX(events.id)`）在**同一个 SQLite 读事务**内完成，
+接口只读，不追加事件、不推进链尾。
+
+```bash
+# 1) 按交付清单核对：每条携带 chain_id / file_hash / current_holder / tail_hash
+curl -s -X POST http://localhost:8000/inventories/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[
+        {"chain_id":"aaaa...","file_hash":"<A 文件摘要>",
+         "current_holder":"carol","tail_hash":"<A 当前链尾>"},
+        {"chain_id":"bbbb...","file_hash":"<B 文件摘要>",
+         "current_holder":"carol","tail_hash":"<B 当前链尾>"}]}'
+# 200 响应：snapshot_event_id 为核对锚定的事件快照（MAX(events.id)，无事件为 0），
+# results 严格按请求 items 顺序给出逐项状态
+# {"snapshot_event_id":17,"matched_count":2,"count":2,
+#  "results":[{"chain_id":"aaaa...","status":"matched"},
+#             {"chain_id":"bbbb...","status":"matched"}]}
+
+# 2) 逐项状态：链不存在 missing；否则按 文件摘要 -> 当前持有人 -> 链尾 顺序
+#    取首个不符项（file_mismatch / holder_mismatch / tail_mismatch），
+#    四项全一致才是 matched；matched_count 只统计 matched 条数
+# {"snapshot_event_id":17,"matched_count":1,"count":4,
+#  "results":[{"chain_id":"aaaa...","status":"matched"},
+#             {"chain_id":"cccc...","status":"missing"},
+#             {"chain_id":"bbbb...","status":"holder_mismatch"},
+#             {"chain_id":"dddd...","status":"tail_mismatch"}]}
+
+# 3) 请求级校验（均为 422，不进入读事务）：
+#    同批 chain_id 重复 / 条数不在 2～100 / file_hash、tail_hash 非 64 位十六进制
+curl -i -X POST http://localhost:8000/inventories/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[
+        {"chain_id":"aaaa...","file_hash":"<A 文件摘要>",
+         "current_holder":"carol","tail_hash":"<A 当前链尾>"},
+        {"chain_id":"aaaa...","file_hash":"<A 文件摘要>",
+         "current_holder":"carol","tail_hash":"<A 当前链尾>"}]}'
+# 422（同批 chain_id 不得重复）
 ```
 
 ### 待接收移交（邀约确认）示例

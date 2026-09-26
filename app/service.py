@@ -147,6 +147,18 @@ receiver，仅在 role=either 时按 chains.first_holder 匹配持有人。首�
 上界与末条排序键（HMAC-SHA256，密钥 AUDIT_CURSOR_SECRET），保证翻页期间新
 追加的移交不进入旧快照、不重不漏；游标损坏或过滤条件不符一律 400 且不回退
 为新查询。
+
+交付清单核对（POST /inventories/reconcile）
+-------------------------------------------
+收货方按交付清单批量核对 2～100 条链（同批 chain_id 不得重复，由请求模型
+保证，重复或条数越界返回 422）。服务端在**同一个 SQLite 读事务**内先把
+「当时最大的事件数据库 id」固定为快照锚点 snapshot_event_id（全库无事件时
+为 0），再按请求顺序逐链读取链头（chains 行）并与清单声明的四项比对：
+链不存在 -> missing；文件摘要 file_hash 不符 -> file_mismatch；当前持有人
+current_holder 不符 -> holder_mismatch；链尾 tail_hash 不符 ->
+tail_mismatch；四项全部一致 -> matched。逐项状态按上述顺序取首个不符项，
+结果严格保持输入顺序，matched_count 统计 matched 条数。本接口**只读**：
+不追加任何事件、不推进任何链尾、不写任何表。
 """
 from __future__ import annotations
 
@@ -1337,6 +1349,62 @@ def verify_chain(chain_id: str) -> dict[str, Any]:
         "reason": reason,
         "recomputed_tail_hash": recomputed_tail,
         "stored_tail_hash": chain["tail_hash"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 交付清单核对（只读批量比对）
+# ---------------------------------------------------------------------------
+
+
+def reconcile_inventory(items: list[dict[str, str]]) -> dict[str, Any]:
+    """按交付清单批量核对 2～100 条链的头信息（只读，不推进任何状态）。
+
+    在**同一个 SQLite 读事务**内完成全部读取：先把「当时最大的事件数据库 id」
+    固定为快照锚点 snapshot_event_id（MAX(events.id)，全库无事件时为 0），
+    再按请求顺序逐链读取链头（chains 行）并与清单声明比对。逐项状态按
+    missing -> file_mismatch -> holder_mismatch -> tail_mismatch 的顺序取首个
+    不符项，四项全部一致为 matched：
+
+    - missing：链不存在（不再比对其余字段）；
+    - file_mismatch：链存在但文件摘要 file_hash 与链头不符；
+    - holder_mismatch：文件摘要一致但当前持有人 current_holder 不符；
+    - tail_mismatch：前三项一致但链尾 tail_hash 不符（清单已过期）。
+
+    结果严格保持输入顺序，matched_count 统计 matched 条数。同批 chain_id
+    不得重复、条数 2～100（均由请求模型保证，违反返回 422）。本函数只读：
+    不追加事件、不推进链尾、不写任何表。
+    """
+    results: list[dict[str, str]] = []
+    matched_count = 0
+    with read_tx() as conn:
+        row = conn.execute("SELECT MAX(id) AS max_id FROM events").fetchone()
+        snapshot_event_id = row["max_id"] if row["max_id"] is not None else 0
+
+        for item in items:
+            chain = conn.execute(
+                """SELECT file_hash, current_holder, tail_hash
+                   FROM chains WHERE chain_id = ?""",
+                (item["chain_id"],),
+            ).fetchone()
+            if chain is None:
+                status = "missing"
+            elif chain["file_hash"] != item["file_hash"]:
+                status = "file_mismatch"
+            elif chain["current_holder"] != item["current_holder"]:
+                status = "holder_mismatch"
+            elif chain["tail_hash"] != item["tail_hash"]:
+                status = "tail_mismatch"
+            else:
+                status = "matched"
+                matched_count += 1
+            results.append({"chain_id": item["chain_id"], "status": status})
+
+    return {
+        "snapshot_event_id": snapshot_event_id,
+        "matched_count": matched_count,
+        "count": len(items),
+        "results": results,
     }
 
 
