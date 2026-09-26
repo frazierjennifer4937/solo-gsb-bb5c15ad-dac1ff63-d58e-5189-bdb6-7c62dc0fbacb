@@ -147,6 +147,17 @@ receiver，仅在 role=either 时按 chains.first_holder 匹配持有人。首�
 上界与末条排序键（HMAC-SHA256，密钥 AUDIT_CURSOR_SECRET），保证翻页期间新
 追加的移交不进入旧快照、不重不漏；游标损坏或过滤条件不符一律 400 且不回退
 为新查询。
+
+交付清单核对（POST /inventories/reconcile）
+-------------------------------------------
+接收方持交付清单一次性核对 2～100 条链是否与服务端一致：请求携带每条链的
+chain_id / file_hash / current_holder / tail_hash（同批 chain_id 不得重复，
+重复或条数越界由请求模型拒绝为 422）。服务端在**同一个 SQLite 读事务**内先
+固定快照上界 snapshot_event_id（当时 MAX(events.id)，无事件时为 0），再按
+请求顺序逐链读取链头比对，按 missing -> file_mismatch -> holder_mismatch ->
+tail_mismatch 的顺序给出首个不一致状态，四项全部一致为 matched；响应返回
+snapshot_event_id、matched_count 与严格保持输入顺序的逐项状态。本接口只读：
+不追加事件、不推进链尾，可安全重试。
 """
 from __future__ import annotations
 
@@ -1876,3 +1887,54 @@ def get_latest_seal(chain_id: str) -> dict[str, Any]:
         if seal is None:
             raise ChainError(404, "seal_not_found", "该链尚无封存记录")
     return _seal_to_dict(seal)
+
+
+# ---------------------------------------------------------------------------
+# 交付清单核对
+# ---------------------------------------------------------------------------
+
+
+def reconcile_inventory(items: list[dict[str, str]]) -> dict[str, Any]:
+    """交付清单核对：在同一读事务快照内逐链比对链头，**绝不写入**。
+
+    在同一个 SQLite 读事务内先固定快照上界 snapshot_event_id（当时最大的事件
+    数据库 id，无事件时为 0），随后按请求顺序逐链读取链头并比对：
+    链条不存在 -> missing；否则依次比对 file_hash -> current_holder ->
+    tail_hash，首个不一致即分别为 file_mismatch / holder_mismatch /
+    tail_mismatch；四项全部一致为 matched。逐项状态严格保持输入顺序返回。
+    本函数只读：不追加事件、不推进链尾，可安全重试；条数（2～100）与
+    chain_id 唯一性由请求模型保证（越界/重复为 422，不进入本函数）。
+    """
+    results: list[dict[str, str]] = []
+    matched_count = 0
+    with read_tx() as conn:
+        snapshot = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events"
+        ).fetchone()
+        snapshot_event_id = snapshot["m"]
+
+        for item in items:
+            chain = conn.execute(
+                """SELECT file_hash, current_holder, tail_hash
+                   FROM chains WHERE chain_id = ?""",
+                (item["chain_id"],),
+            ).fetchone()
+            if chain is None:
+                status = "missing"
+            elif chain["file_hash"] != item["file_hash"]:
+                status = "file_mismatch"
+            elif chain["current_holder"] != item["current_holder"]:
+                status = "holder_mismatch"
+            elif chain["tail_hash"] != item["tail_hash"]:
+                status = "tail_mismatch"
+            else:
+                status = "matched"
+                matched_count += 1
+            results.append({"chain_id": item["chain_id"], "status": status})
+
+    return {
+        "snapshot_event_id": snapshot_event_id,
+        "matched_count": matched_count,
+        "count": len(results),
+        "results": results,
+    }

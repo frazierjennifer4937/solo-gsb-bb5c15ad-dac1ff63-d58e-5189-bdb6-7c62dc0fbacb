@@ -18,6 +18,8 @@ _WITNESS_MIN = 2
 _WITNESS_MAX = 5
 _HANDOVER_BATCH_MIN = 2
 _HANDOVER_BATCH_MAX = 20
+_INVENTORY_RECONCILE_MIN = 2
+_INVENTORY_RECONCILE_MAX = 100
 
 def _validate_name(value: str, field: str) -> str:
     value = value.strip()
@@ -304,6 +306,98 @@ class HandoverBatchResult(BaseModel):
     )
     results: list[HandoverBatchResultItem] = Field(
         ..., description="各链移交结果，严格按请求 items 顺序"
+    )
+
+
+class InventoryReconcileItem(BaseModel):
+    """交付清单核对请求中的单条链：链 ID 与交付方认定的文件摘要、当前持有人、链尾。"""
+
+    chain_id: str = Field(..., description="交接链 ID（同批内不得重复）")
+    file_hash: str = Field(
+        ..., description="交付方认定的该链文件 SHA-256 摘要（64 位十六进制）"
+    )
+    current_holder: str = Field(..., description="交付方认定的该链当前持有人标识")
+    tail_hash: str = Field(
+        ..., description="交付方认定的该链当前链尾哈希（64 位十六进制）"
+    )
+
+    @field_validator("chain_id")
+    @classmethod
+    def _check_chain_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("chain_id 不能为空")
+        return v
+
+    @field_validator("file_hash")
+    @classmethod
+    def _check_file_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "file_hash")
+
+    @field_validator("current_holder")
+    @classmethod
+    def _check_current_holder(cls, v: str) -> str:
+        return _validate_name(v, "current_holder")
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+
+class InventoryReconcileRequest(BaseModel):
+    """POST /inventories/reconcile 请求体：2～100 条不重复的链（只读核对）。"""
+
+    items: list[InventoryReconcileItem] = Field(
+        ...,
+        min_length=_INVENTORY_RECONCILE_MIN,
+        max_length=_INVENTORY_RECONCILE_MAX,
+        description=(
+            f"交付清单（{_INVENTORY_RECONCILE_MIN}～{_INVENTORY_RECONCILE_MAX} 条，"
+            "chain_id 不得重复）；逐项与服务端链头比对，结果保持此顺序"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_chain_ids(self) -> "InventoryReconcileRequest":
+        ids = [item.chain_id for item in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("同批 chain_id 不得重复")
+        return self
+
+
+class InventoryReconcileItemResult(BaseModel):
+    """交付清单核对结果中的单条链：链 ID 与逐项比对状态。"""
+
+    chain_id: str
+    status: Literal[
+        "matched", "missing", "file_mismatch", "holder_mismatch", "tail_mismatch"
+    ] = Field(
+        ...,
+        description=(
+            "逐项比对状态：missing（链条不存在）→ file_mismatch（文件摘要不符）→ "
+            "holder_mismatch（当前持有人不符）→ tail_mismatch（链尾不符），"
+            "按此顺序给出首个不一致；全部一致为 matched"
+        ),
+    )
+
+
+class InventoryReconcileResult(BaseModel):
+    snapshot_event_id: int = Field(
+        ...,
+        description=(
+            "本次核对锚定的快照上界：同一读事务内当时最大的事件数据库 id"
+            "（无事件时为 0）；核对结果对应该快照点，之后新追加的事件不影响本结果"
+        ),
+    )
+    matched_count: int = Field(
+        ..., description="逐项状态为 matched 的链数（0～请求条数）"
+    )
+    count: int = Field(
+        ..., description="本次核对的链数（等于请求 items 条数，2～100）"
+    )
+    results: list[InventoryReconcileItemResult] = Field(
+        ..., description="各链核对状态，严格按请求 items 顺序"
     )
 
 

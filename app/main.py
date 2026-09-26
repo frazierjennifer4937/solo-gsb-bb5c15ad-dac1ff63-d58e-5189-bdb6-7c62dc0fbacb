@@ -22,6 +22,8 @@ from .schemas import (
     HandoverRequest,
     HandoverResult,
     HealthOut,
+    InventoryReconcileRequest,
+    InventoryReconcileResult,
     OfferCancelRequest,
     OfferCancelResult,
     OfferConfirmRequest,
@@ -58,6 +60,7 @@ from .service import (
     get_witness_status,
     list_chains,
     record_witness_decision,
+    reconcile_inventory,
     release_seal,
     replace_offer,
     verify_batch_proof,
@@ -76,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -230,6 +233,30 @@ def api_handover_batch(req: HandoverBatchRequest) -> HandoverBatchResult:
         **append_handover_batch(
             req.receiver, [item.model_dump() for item in req.items]
         )
+    )
+
+
+@app.post(
+    "/inventories/reconcile",
+    response_model=InventoryReconcileResult,
+    tags=["inventories"],
+    summary="交付清单核对：2～100 条链的只读快照比对",
+    description=(
+        "接收方持交付清单一次性核对 2～100 条链是否与服务端一致：请求携带每条链的"
+        " chain_id、file_hash、current_holder、tail_hash（同批 chain_id 不得重复，"
+        "重复或条数越界返回 422）。服务端在同一个 SQLite 读事务内先固定快照上界 "
+        "snapshot_event_id（当时最大的事件数据库 id，无事件时为 0），再按请求顺序"
+        "逐链读取链头比对：按 missing → file_mismatch → holder_mismatch → "
+        "tail_mismatch 的顺序给出首个不一致状态，四项全部一致为 matched。响应返回"
+        " snapshot_event_id、matched_count 与严格保持输入顺序的逐项状态。本接口"
+        "只读：不追加事件、不推进链尾，可安全重试。"
+    ),
+)
+def api_reconcile_inventory(
+    req: InventoryReconcileRequest,
+) -> InventoryReconcileResult:
+    return InventoryReconcileResult(
+        **reconcile_inventory([item.model_dump() for item in req.items])
     )
 
 

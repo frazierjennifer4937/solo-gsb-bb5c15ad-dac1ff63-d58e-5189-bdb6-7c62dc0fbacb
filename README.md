@@ -235,6 +235,17 @@
      `created_at`，创世事件的 `giver` / `receiver` / `nonce` / `prev_hash`
      为空串。`created_from` 晚于 `created_to` 返回 **400**
      `invalid_time_range`。
+- **交付清单核对** `POST /inventories/reconcile`：线下交接完成后，接收方可持
+  「交付清单」一次性核对 **2～100 条**链是否与服务端一致。请求携带每条链的
+  `chain_id`、`file_hash`、`current_holder`、`tail_hash`（**同批 `chain_id`
+  不得重复**，重复或条数不在 2～100 范围内返回 422）。服务端在**同一个
+  SQLite 读事务**内先固定快照上界 `snapshot_event_id`（当时最大的事件数据库
+  id，无事件时为 0），再按请求顺序逐链读取链头比对，按 **`missing` →
+  `file_mismatch` → `holder_mismatch` → `tail_mismatch`** 的顺序给出首个不
+  一致状态，四项全部一致为 `matched`；响应返回 `snapshot_event_id`、
+  `matched_count` 与**严格保持输入顺序**的逐项状态。本接口**只读**：不追加
+  事件、不推进链尾，可安全重试；`snapshot_event_id` 可据此判断核对结果对应
+  的数据库快照点（之后新追加的事件不影响本次结果）。
 
 ## 一条命令启动（依赖安装 + 数据库初始化 + 启动）
 
@@ -282,6 +293,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/chains` | 创建交接链（文件摘要 + 首位持有人） |
 | `POST` | `/handovers` | 执行一次移交（链尾哈希 + 接收方 + 一次性随机数） |
 | `POST` | `/handover-batches` | 批量移交：同一批 2～20 条链（同批 chain_id 不得重复）在一个立即事务内整批校验并追加事件、推进各链尾给同一接收方；任一链不存在/封存生效/链尾过期/随机数重放则整批回滚，任何链不新增事件；响应按请求顺序返回各链新 seq 与 tail_hash |
+| `POST` | `/inventories/reconcile` | 交付清单核对：2～100 条链（同批 chain_id 不得重复）在同一读事务快照内逐链比对 file_hash/current_holder/tail_hash，按 missing→file_mismatch→holder_mismatch→tail_mismatch 给出逐项状态（全一致为 matched），返回 snapshot_event_id 与 matched_count，结果保持输入顺序；只读，不追加事件或推进链尾 |
 | `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选撤销码，凭码可撤销/替换；可选 2～5 名见证人与阈值） |
 | `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
 | `POST` | `/offers/{offer_id}/cancel` | 凭一次性撤销码撤销邀约（仅 pending 且链尾未推进/未过期/无拒绝；错码 403，终态或无撤销码 409；不改链） |
@@ -349,6 +361,11 @@ chain_id/holder/role/created_from/created_to 不符；**不会回退为新查询
 命中即整批回滚（包括本来可以成功的链），错误 `detail` 中附带首个失败链的
 `chain_id`；同批 `chain_id` 重复、条数不在 2～20 或字段格式非法为请求级
 **422**。
+
+交付清单核对 `POST /inventories/reconcile` 同样**不引入新错误码**：逐项比对
+结果在 200 响应的 `results` 中表达（`matched` / `missing` / `file_mismatch` /
+`holder_mismatch` / `tail_mismatch`），链条不存在不会使整批失败；同批
+`chain_id` 重复、条数不在 2～100 或字段格式非法为请求级 **422**。
 
 ## 使用示例
 
@@ -429,6 +446,44 @@ curl -i -X POST http://localhost:8000/handover-batches \
          {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"x1"},
          {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"x2"}]}'
 # 422（同批 chain_id 不得重复）；注意各链 nonce 相互独立，不同链允许相同 nonce
+```
+
+### 交付清单核对示例
+
+适用于「线下交接完成后，接收方持交付清单一次性核对多条链是否与服务端一致」的
+场景：2～100 条链的比对在**同一个 SQLite 读事务**内完成，只读、可安全重试。
+
+```bash
+# 1) 接收方持交付清单核对两条链（results 严格按输入顺序返回）
+curl -s -X POST http://localhost:8000/inventories/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[
+        {"chain_id":"aaaa...","file_hash":"<A 文件摘要>",
+         "current_holder":"carol","tail_hash":"<A 当前链尾>"},
+        {"chain_id":"bbbb...","file_hash":"<B 文件摘要>",
+         "current_holder":"carol","tail_hash":"<过期的 B 旧链尾>"}]}'
+# 200 响应：
+# {"snapshot_event_id":42,"matched_count":1,"count":2,
+#  "results":[{"chain_id":"aaaa...","status":"matched"},
+#             {"chain_id":"bbbb...","status":"tail_mismatch"}]}
+# snapshot_event_id 为本次读事务快照内最大的事件数据库 id（无事件时为 0），
+# 核对结果对应该快照点；本接口只读，链的事件数与链尾不会因核对而改变
+
+# 2) 逐项状态判定顺序（给出首个不一致）：
+#    missing（链不存在）→ file_mismatch（文件摘要不符）
+#    → holder_mismatch（当前持有人不符）→ tail_mismatch（链尾不符）；
+#    四项全部一致才是 matched；matched_count 统计 matched 的条数
+
+# 3) 请求级校验（均为 422，不进入事务）：
+#    同批 chain_id 重复 / 条数不在 2～100 / file_hash、tail_hash 非 64 位十六进制
+curl -i -X POST http://localhost:8000/inventories/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[
+        {"chain_id":"aaaa...","file_hash":"<A 文件摘要>",
+         "current_holder":"carol","tail_hash":"<A 当前链尾>"},
+        {"chain_id":"aaaa...","file_hash":"<A 文件摘要>",
+         "current_holder":"carol","tail_hash":"<A 当前链尾>"}]}'
+# 422（同批 chain_id 不得重复）
 ```
 
 ### 待接收移交（邀约确认）示例
@@ -862,7 +917,7 @@ curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=2
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
 │   ├── audit.py       # 交接事件审计检索：快照上界翻页、过滤条件摘要与 HMAC 签名游标
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验 / Merkle 包含证明与批量 multiproof 的生成与校验）
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 交付清单核对 / 查询 / 校验 / Merkle 包含证明与批量 multiproof 的生成与校验）
 │   ├── merkle.py      # Merkle 包含证明纯函数：叶子/内部节点/快照摘要、单事件与批量 multiproof 的构造与离线重算（不读数据库）
 │   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
